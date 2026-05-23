@@ -223,20 +223,32 @@ function makeRun(programId, opts = {}) {
   return {
     id: opts.id || `run-${Math.random().toString(36).slice(2, 8)}`,
     programId,
+    runIndex: opts.runIndex || 1,  // 1-indexed within this program's history
     startedOn: date,
-    endedOn: null,
+    endedOn: opts.endedOn || null,
     status: opts.status || 'active',
     currentRound: opts.currentRound || 1,
     currentDayIdx: opts.currentDayIdx || 0,
     startWeights: opts.startWeights || defaultStartWeights(),
     log: opts.log || {},          // keyed by `${exId}-r${round}-d${dayIdx}` → [bool per set]
     actuals: opts.actuals || {},  // keyed same → { weight, reps, sets } overrides
+    dayOverrides: opts.dayOverrides || {},  // per-dayIdx → array of exercise IDs
     sessions: opts.sessions || [],// completed sessions: { round, dayIdx, durationMs, startedAt, finishedAt, log, actuals }
     session: opts.session || {    // currently-in-progress session timer
       state: 'idle', startedAt: null, firstStartedAt: null, accumMs: 0, pausedAt: null,
     },
     peakWeights: opts.peakWeights || {},
   };
+}
+
+// ─── Helpers: run history per program ────────────────────────────────────────
+// Past runs (any status) for a given program, oldest-first.
+function runsForProgram(programId, runs) {
+  return runs.filter((r) => r.programId === programId);
+}
+// Next runIndex to assign when deploying — = (count of existing runs) + 1.
+function nextRunIndex(programId, runs) {
+  return runsForProgram(programId, runs).length + 1;
 }
 
 // ─── Weight step inference — what does ± do for this exercise? ──────────────
@@ -250,13 +262,44 @@ function weightStep(exercise, units) {
   return isBar ? base * 2 : base;
 }
 
-// Seed one active run for the custom program, mid-cycle (round 3, day 2)
-// so the prototype lands on something interesting. Session is mid-tick at
-// landing — timer shows ~14 minutes elapsed so the timer feature reads at first
-// glance.
+// Seed runs: one active (mid-cycle, with a live timer so the prototype lands
+// on something interesting), plus a few completed/cancelled past runs of
+// built-in programs so the catalogue backlinks have data to show.
 const SEED_RUNS = [
+  // Completed linear novice run — last year
+  makeRun('linear', {
+    id: 'run-linear-1',
+    runIndex: 1,
+    startedOn: '2025-09-01',
+    endedOn: '2025-11-24',
+    status: 'complete',
+    currentRound: 12, currentDayIdx: 2,
+    peakWeights: { bench: 100, squat: 130, dead: 160, ohp: 60 },
+  }),
+  // Completed Sheiko #29 run — earlier this year
+  makeRun('sheiko-29', {
+    id: 'run-sheiko29-1',
+    runIndex: 1,
+    startedOn: '2025-12-15',
+    endedOn: '2026-01-12',
+    status: 'complete',
+    currentRound: 4, currentDayIdx: 3,
+    peakWeights: { bench: 115, squat: 150, dead: 180 },
+  }),
+  // Cancelled Smolov Bench attempt — gave up mid-cycle
+  makeRun('smolov-bench', {
+    id: 'run-smolov-1',
+    runIndex: 1,
+    startedOn: '2026-02-01',
+    endedOn: '2026-02-22',
+    status: 'cancelled',
+    currentRound: 2, currentDayIdx: 1,
+    peakWeights: { bench: 117 },
+  }),
+  // Active run — custom strength block, mid-cycle, live timer at landing
   makeRun('custom-strength-1', {
     id: 'run-active',
+    runIndex: 1,
     startedOn: '2026-04-20',
     status: 'active',
     currentRound: 3,
@@ -282,6 +325,69 @@ function findRun(id, runs = SEED_RUNS) { return runs.find((r) => r.id === id); }
 function formulaFor(program, groupId) {
   return (program?.formulaOverrides && program.formulaOverrides[groupId])
       || (SEED_GROUPS.find((g) => g.id === groupId)?.formula);
+}
+
+// ─── Mesocycle layout — spread workouts across the round ─────────────────────
+// Given a program with `workoutDaysPerRound` workouts to fit into `roundDays`
+// calendar slots, distribute them evenly. e.g. 3 workouts in 7 days → days
+// 0, 2, 4 (Mon/Wed/Fri). Returns an array of { dayOfRound, dayTemplateIdx }.
+function workoutSlotsForRound(program) {
+  const slots = [];
+  for (let i = 0; i < program.workoutDaysPerRound; i++) {
+    const dayOfRound = Math.floor(i * program.roundDays / program.workoutDaysPerRound);
+    slots.push({ dayOfRound, dayTemplateIdx: i });
+  }
+  return slots;
+}
+// Look up the day template at a given day-of-round, or null if rest.
+function dayTemplateAtRoundDay(program, dayOfRound) {
+  const slots = workoutSlotsForRound(program);
+  const slot = slots.find((s) => s.dayOfRound === dayOfRound);
+  return slot ? { day: program.days[slot.dayTemplateIdx], dayTemplateIdx: slot.dayTemplateIdx } : null;
+}
+
+// ─── Per-run day overrides ───────────────────────────────────────────────────
+// A run can override its program's day-by-day exercise lists (for add / remove
+// / reorder on the Active screen). `run.dayOverrides[dayIdx]` is an array of
+// exercise IDs that replaces `program.days[dayIdx].exercises` when set.
+// `restoreDayDefault` simply deletes the override.
+function effectiveDayExercises(run, program, dayIdx) {
+  const override = run?.dayOverrides?.[dayIdx];
+  if (override && Array.isArray(override)) return override;
+  return program?.days?.[dayIdx]?.exercises || [];
+}
+function isDayOverridden(run, dayIdx) {
+  return !!(run?.dayOverrides && Array.isArray(run.dayOverrides[dayIdx]));
+}
+// Pure helpers: return a NEW dayOverrides map (caller merges into run via setState).
+function _liftOverride(run, program, dayIdx) {
+  if (isDayOverridden(run, dayIdx)) return run.dayOverrides[dayIdx].slice();
+  return (program?.days?.[dayIdx]?.exercises || []).slice();
+}
+function addExerciseToDayOverrides(run, program, dayIdx, exId) {
+  const next = _liftOverride(run, program, dayIdx);
+  next.push(exId);
+  return { ...(run.dayOverrides || {}), [dayIdx]: next };
+}
+function removeExerciseFromDayOverrides(run, program, dayIdx, atIdx) {
+  const next = _liftOverride(run, program, dayIdx);
+  if (atIdx < 0 || atIdx >= next.length) return run.dayOverrides || {};
+  next.splice(atIdx, 1);
+  return { ...(run.dayOverrides || {}), [dayIdx]: next };
+}
+function reorderDayOverrides(run, program, dayIdx, fromIdx, toIdx) {
+  const next = _liftOverride(run, program, dayIdx);
+  if (fromIdx === toIdx) return run.dayOverrides || {};
+  if (fromIdx < 0 || fromIdx >= next.length) return run.dayOverrides || {};
+  const [item] = next.splice(fromIdx, 1);
+  next.splice(Math.max(0, Math.min(next.length, toIdx)), 0, item);
+  return { ...(run.dayOverrides || {}), [dayIdx]: next };
+}
+function clearDayOverride(run, dayIdx) {
+  if (!run.dayOverrides) return {};
+  const next = { ...run.dayOverrides };
+  delete next[dayIdx];
+  return next;
 }
 
 // Augment exercise with start weight from active run (so projectedKg sees
@@ -458,5 +564,10 @@ Object.assign(window, {
   projectedKg, displayProjection, roundsToGoal, generatePlan, formulaText,
   estimateSeconds, estimateMinutes,
   findExercise, findGroup, findProgram, findRun, formulaFor, exerciseInRun, makeRun, defaultStartWeights,
+  effectiveDayExercises, isDayOverridden,
+  addExerciseToDayOverrides, removeExerciseFromDayOverrides,
+  reorderDayOverrides, clearDayOverride,
+  workoutSlotsForRound, dayTemplateAtRoundDay,
+  runsForProgram, nextRunIndex,
   equipKey,
 });

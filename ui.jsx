@@ -361,7 +361,37 @@ const PhoneShell = ({ children, width = 412, height = 892 }) => {
   );
 };
 
+// ─── Confirm dialog — modal with title + body + OK/Cancel ───────────────────
+// Overlays its nearest positioned ancestor (inset:0). Pair with a positioned
+// wrapper for scope. Shared between Active (finish-session) and Catalogue
+// (deploy-program) confirms.
+const ConfirmDialog = ({ title, body, okLabel, cancelLabel, onOk, onCancel, okTone = 'accent' }) => {
+  const t = useTheme();
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, zIndex: 80,
+      background: 'rgba(0,0,0,0.6)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24,
+      animation: 'dialogIn 160ms cubic-bezier(.3,.7,.4,1)',
+    }}>
+      <style>{`@keyframes dialogIn { from { opacity: 0; } to { opacity: 1; } }`}</style>
+      <div style={{
+        background: t.surface, border: `1px solid ${t.line}`,
+        borderRadius: 16, padding: 18, width: '100%', maxWidth: 340,
+      }}>
+        <div style={{ fontFamily: t.ui, fontSize: 16, fontWeight: 700, color: t.fg, marginBottom: 6 }}>{title}</div>
+        <div style={{ fontFamily: t.mono, fontSize: 11, color: t.fgMute, marginBottom: 16, lineHeight: 1.5 }}>{body}</div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Btn variant="quiet" size="md" style={{ flex: 1 }} onClick={onCancel}>{cancelLabel}</Btn>
+          <Btn variant={okTone} size="md" style={{ flex: 1 }} onClick={onOk}>{okLabel}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 Object.assign(window, {
   ThemeCtx, useTheme, Icon, Card, Section, Pill, Btn, KV, Stepper,
   GroupDot, BottomTabs, TopBar, Brand, Sparkline, Toast, PhoneShell,
+  ConfirmDialog,
 });

@@ -42,7 +42,9 @@ function Shell({ tweaks, setTweak, theme }) {
   // ── Domain state ──
   const [programs, setPrograms] = React.useState(SEED_PROGRAMS);
   const [runs, setRuns] = React.useState(SEED_RUNS);
-  const [activeRunId, setActiveRunId] = React.useState(SEED_RUNS[0]?.id || null);
+  const [activeRunId, setActiveRunId] = React.useState(
+    (SEED_RUNS.find((r) => r.status === 'active') || SEED_RUNS[0])?.id || null
+  );
 
   const activeRun = runs.find((r) => r.id === activeRunId) || null;
   const activeProgram = activeRun ? programs.find((p) => p.id === activeRun.programId) : null;
@@ -120,20 +122,57 @@ function Shell({ tweaks, setTweak, theme }) {
     return { ...r, actuals: { ...r.actuals, [key]: { ...cur, perSet }}};
   });
 
+  // ── Day-list mutations (add / remove / reorder / restore) ────────────────
+  // Operate on run.dayOverrides[currentDayIdx]; the program itself is untouched.
+  // New exercises added on the fly get the "classic" default (3×8) via
+  // run.actuals — weight projection still uses the seed startKg.
+  const addExerciseToToday = (exId) => updateRun(activeRunId, (r) => {
+    const program = programs.find((p) => p.id === r.programId);
+    const dayOverrides = addExerciseToDayOverrides(r, program, r.currentDayIdx, exId);
+    const key = `${exId}-r${r.currentRound}-d${r.currentDayIdx}`;
+    const curAct = r.actuals[key] || {};
+    // Seed classic default: 3 sets, 8 reps. We write defaultReps so the
+    // exercise card reads "8" instead of the seed's prescribed reps.
+    const actuals = {
+      ...r.actuals,
+      [key]: { ...curAct, sets: curAct.sets ?? 3, defaultReps: curAct.defaultReps ?? 8 },
+    };
+    return { ...r, dayOverrides, actuals };
+  });
+  const removeExerciseFromToday = (atIdx) => updateRun(activeRunId, (r) => {
+    const program = programs.find((p) => p.id === r.programId);
+    const dayOverrides = removeExerciseFromDayOverrides(r, program, r.currentDayIdx, atIdx);
+    return { ...r, dayOverrides };
+  });
+  const reorderToday = (fromIdx, toIdx) => updateRun(activeRunId, (r) => {
+    const program = programs.find((p) => p.id === r.programId);
+    const dayOverrides = reorderDayOverrides(r, program, r.currentDayIdx, fromIdx, toIdx);
+    return { ...r, dayOverrides };
+  });
+  const restoreTodayDefault = () => updateRun(activeRunId, (r) => {
+    const dayOverrides = clearDayOverride(r, r.currentDayIdx);
+    return { ...r, dayOverrides };
+  });
+
   const adoptProgram = (program, bump = 2.5) => {
     // End current run (if any) and start a new one for the chosen program.
     if (activeRunId) updateRun(activeRunId, { status: 'cancelled', endedOn: new Date().toISOString().slice(0, 10) });
     // Find past peak of this program; use to bump start weights if available.
-    const past = runs.filter((r) => r.programId === program.id && r.peakWeights).slice(-1)[0];
+    const past = runs.filter((r) => r.programId === program.id && r.peakWeights);
+    const lastWithPeak = past.slice(-1)[0];
     const startWeights = defaultStartWeights();
-    if (past?.peakWeights) {
+    if (lastWithPeak?.peakWeights) {
       // Bump-per-cycle model: new start = previous start + bump (not peak — peak is too high).
       for (const k of Object.keys(startWeights)) {
-        const prevStart = past.startWeights?.[k] ?? startWeights[k];
+        const prevStart = lastWithPeak.startWeights?.[k] ?? startWeights[k];
         startWeights[k] = prevStart + bump;
       }
     }
-    const newRun = makeRun(program.id, { startWeights, status: 'active' });
+    const newRun = makeRun(program.id, {
+      startWeights,
+      status: 'active',
+      runIndex: nextRunIndex(program.id, runs),
+    });
     setRuns((rs) => [...rs, newRun]);
     setActiveRunId(newRun.id);
     setTab('active');
@@ -155,7 +194,11 @@ function Shell({ tweaks, setTweak, theme }) {
                             density={tweaks.density} onLog={onLog}
                             startSession={startSession} pauseSession={pauseSession}
                             resumeSession={resumeSession} finishSession={finishSession}
-                            setActuals={setActuals} setSetActuals={setSetActuals} />;
+                            setActuals={setActuals} setSetActuals={setSetActuals}
+                            onAddExercise={addExerciseToToday}
+                            onRemoveExercise={removeExerciseFromToday}
+                            onReorderExercises={reorderToday}
+                            onRestoreDefault={restoreTodayDefault} />;
     } else {
       screen = <EmptyActive onGoCatalogue={() => setTab('catalogue')} />;
     }
@@ -171,6 +214,7 @@ function Shell({ tweaks, setTweak, theme }) {
   if (tab === 'catalogue') {
     screen = <ScreenCatalogue programs={programs} runs={runs} activeRunId={activeRunId}
                               onAdopt={adoptProgram}
+                              onOpenStats={(programId) => setTab('progress')}
                               units={tweaks.units} density={tweaks.density} />;
   }
   if (tab === 'settings') {

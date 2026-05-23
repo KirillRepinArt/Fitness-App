@@ -2,6 +2,66 @@
 // inline < > steppers for weight, reps, sets. Designed for use mid-workout:
 // big touch targets, glanceable timer, one-tap completion.
 
+// ─── Drag-reorder hook ──────────────────────────────────────────────────────
+// Pointer-event based vertical reorder. The drag handle button captures the
+// pointer on down, so all subsequent move/up events route to that same
+// element — so all pointer handlers live in the bundle returned by
+// getHandleProps(id). Cards swap as the dragged card's center crosses a
+// neighbor's; on each swap we reset startFingerY so the card snaps to the
+// new slot's natural position (= where the finger already is).
+function useReorderable(ids, onReorder) {
+  const [drag, setDrag] = React.useState(null); // { id, pointerId, startFingerY, fingerY }
+  const refs = React.useRef({});
+  const setRef = React.useCallback((id) => (el) => {
+    if (el) refs.current[id] = el; else delete refs.current[id];
+  }, []);
+
+  const getHandleProps = (id) => ({
+    onPointerDown: (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation();
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+      setDrag({ id, pointerId: e.pointerId, startFingerY: e.clientY, fingerY: e.clientY });
+    },
+    onPointerMove: (e) => {
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      const fingerY = e.clientY;
+      const fromIdx = ids.indexOf(drag.id);
+      if (fromIdx < 0) return;
+      const draggedEl = refs.current[drag.id];
+      if (!draggedEl) { setDrag((d) => d ? { ...d, fingerY } : d); return; }
+      const draggedRect = draggedEl.getBoundingClientRect();
+      const cardCenter = draggedRect.top + draggedRect.height / 2;
+      let toIdx = fromIdx;
+      for (let i = 0; i < ids.length; i++) {
+        if (i === fromIdx) continue;
+        const el = refs.current[ids[i]];
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        const otherCenter = r.top + r.height / 2;
+        if (i < fromIdx && cardCenter < otherCenter) { toIdx = i; break; }
+        if (i > fromIdx && cardCenter > otherCenter) { toIdx = i; }
+      }
+      if (toIdx !== fromIdx) {
+        onReorder(fromIdx, toIdx);
+        setDrag((d) => d ? { ...d, fingerY, startFingerY: fingerY } : d);
+      } else {
+        setDrag((d) => d ? { ...d, fingerY } : d);
+      }
+    },
+    onPointerUp: (e) => {
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      setDrag(null);
+    },
+    onPointerCancel: (e) => {
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      setDrag(null);
+    },
+  });
+
+  return { drag, getHandleProps, setRef };
+}
+
 // ─── Live elapsed-time hook ─────────────────────────────────────────────────
 // Re-renders every second while the session is active; returns total ms.
 function useElapsed(session) {
@@ -133,32 +193,6 @@ const SessionBar = ({ session, units, onStart, onPause, onResume, onFinish }) =>
         }}>
           <Icon name="check" size={22} stroke={2.5} color={t.bg} />
         </button>
-      </div>
-    </div>
-  );
-};
-
-// ─── Confirm-finish modal ───────────────────────────────────────────────────
-const ConfirmDialog = ({ title, body, okLabel, cancelLabel, onOk, onCancel }) => {
-  const t = useTheme();
-  return (
-    <div style={{
-      position: 'absolute', inset: 0, zIndex: 60,
-      background: 'rgba(0,0,0,0.6)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24,
-      animation: 'dialogIn 160ms cubic-bezier(.3,.7,.4,1)',
-    }}>
-      <style>{`@keyframes dialogIn { from { opacity: 0; } to { opacity: 1; } }`}</style>
-      <div style={{
-        background: t.surface, border: `1px solid ${t.line}`,
-        borderRadius: 16, padding: 18, width: '100%', maxWidth: 340,
-      }}>
-        <div style={{ fontFamily: t.ui, fontSize: 16, fontWeight: 700, color: t.fg, marginBottom: 6 }}>{title}</div>
-        <div style={{ fontFamily: t.mono, fontSize: 11, color: t.fgMute, marginBottom: 16, lineHeight: 1.5 }}>{body}</div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Btn variant="quiet" size="md" style={{ flex: 1 }} onClick={onCancel}>{cancelLabel}</Btn>
-          <Btn variant="accent" size="md" style={{ flex: 1 }} onClick={onOk}>{okLabel}</Btn>
-        </div>
       </div>
     </div>
   );
@@ -319,7 +353,8 @@ const RestCountdown = ({ totalSec, startedAt, onSkip }) => {
 // ─── Exercise card — header + per-set rows + rest countdown ─────────────────
 const ExerciseCard = ({ ex, group, units, round, program, density, restOn = true, defaultRestSec = 180,
                         doneArr, setDoneArr, actuals, onActuals, onSetActuals,
-                        expanded, onToggle }) => {
+                        expanded, onToggle,
+                        dragHandleProps, onRemove, dragging }) => {
   const t = useTheme();
   const T = useT();
 
@@ -327,7 +362,10 @@ const ExerciseCard = ({ ex, group, units, round, program, density, restOn = true
   const projected = projectedKg(ex, group, round, program);
   const plannedKgSnap = snapForUnits(projected, group, ex.equip, 'kg');
   const plannedWeight = Number(fmtWeight(plannedKgSnap, units));
-  const plannedReps = ex.reps;
+  // For freshly-added exercises we honour actuals.defaultReps (set to 8 at
+  // add-time) so the prescribed-reps display reads 8 even though the seed
+  // exercise has its own canonical rep count (e.g. bench = 5).
+  const plannedReps = actuals?.defaultReps ?? ex.reps;
   const plannedSets = ex.sets;
   const wStep = weightStep(ex, units);
 
@@ -377,38 +415,73 @@ const ExerciseCard = ({ ex, group, units, round, program, density, restOn = true
 
   return (
     <Card padding={0} accent={allDone ? t.success : isModified ? t.signal : undefined}>
-      {/* Header — tap to expand */}
-      <div onClick={onToggle} style={{
-        padding: `${density === 'compact' ? 12 : 16}px ${density === 'compact' ? 14 : 16}px`,
-        cursor: 'pointer',
-        display: 'flex', alignItems: 'center', gap: 12,
-      }}>
-        <div style={{
-          width: 36, height: 36, borderRadius: 10, flexShrink: 0,
-          background: t.surface2, border: `1px solid ${t.line}`,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
+      {/* Header — drag handle | tappable content | remove */}
+      <div style={{ display: 'flex', alignItems: 'stretch' }}>
+        {dragHandleProps && (
+          <button {...dragHandleProps}
+                  onClick={(e) => e.stopPropagation()}
+                  aria-label="drag to reorder"
+                  style={{
+                    width: 26, alignSelf: 'stretch',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    background: 'transparent', border: 0,
+                    color: t.fgDim, cursor: dragging ? 'grabbing' : 'grab',
+                    touchAction: 'none', flexShrink: 0,
+                    padding: 0,
+                  }}>
+            <Icon name="grip" size={16} color={dragging ? t.fg : t.fgDim} />
+          </button>
+        )}
+        <div onClick={onToggle} style={{
+          flex: 1, minWidth: 0,
+          paddingTop: density === 'compact' ? 12 : 16,
+          paddingBottom: density === 'compact' ? 12 : 16,
+          paddingLeft: dragHandleProps ? 0 : (density === 'compact' ? 14 : 16),
+          paddingRight: onRemove ? 0 : (density === 'compact' ? 14 : 16),
+          cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 12,
         }}>
-          <GroupDot id={group.id} size={10} />
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-            <span style={{ fontFamily: t.ui, fontWeight: 600, fontSize: 15, color: t.fg, letterSpacing: -0.1 }}>
-              {T(ex.nameKey)}
-            </span>
-            {isRecovery && <Pill tone="signal">{T('common.deloadCaps')}</Pill>}
+          <div style={{
+            width: 36, height: 36, borderRadius: 10, flexShrink: 0,
+            background: t.surface2, border: `1px solid ${t.line}`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <GroupDot id={group.id} size={10} />
           </div>
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <span style={{ fontFamily: t.mono, fontSize: 11, color: t.fgMute, fontVariantNumeric: 'tabular-nums' }}>
-              {setsCount}×{repSummary} · {weightSummary} {unitLabel(units)}
-            </span>
-            <span style={{ fontFamily: t.mono, fontSize: 11, color: t.fgDim }}>· {T(equipKey(ex.equip))}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+              <span style={{ fontFamily: t.ui, fontWeight: 600, fontSize: 15, color: t.fg, letterSpacing: -0.1 }}>
+                {T(ex.nameKey)}
+              </span>
+              {isRecovery && <Pill tone="signal">{T('common.deloadCaps')}</Pill>}
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              <span style={{ fontFamily: t.mono, fontSize: 11, color: t.fgMute, fontVariantNumeric: 'tabular-nums' }}>
+                {setsCount}×{repSummary} · {weightSummary} {unitLabel(units)}
+              </span>
+              <span style={{ fontFamily: t.mono, fontSize: 11, color: t.fgDim }}>· {T(equipKey(ex.equip))}</span>
+            </div>
           </div>
+          <div style={{
+            fontFamily: t.mono, fontSize: 11, color: allDone ? t.success : t.fgMute,
+            fontVariantNumeric: 'tabular-nums', fontWeight: 600,
+          }}>{doneCount}/{setsCount}</div>
+          <Icon name={expanded ? 'chevD' : 'chev'} size={16} color={t.fgDim} />
         </div>
-        <div style={{
-          fontFamily: t.mono, fontSize: 11, color: allDone ? t.success : t.fgMute,
-          fontVariantNumeric: 'tabular-nums', fontWeight: 600,
-        }}>{doneCount}/{setsCount}</div>
-        <Icon name={expanded ? 'chevD' : 'chev'} size={16} color={t.fgDim} />
+        {onRemove && (
+          <button onClick={(e) => { e.stopPropagation(); onRemove(); }}
+                  aria-label="remove exercise"
+                  style={{
+                    width: 32, alignSelf: 'stretch',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    background: 'transparent', border: 0,
+                    borderLeft: `1px solid ${t.line}`,
+                    color: t.fgDim, cursor: 'pointer',
+                    flexShrink: 0, padding: 0,
+                  }}>
+            <Icon name="x" size={14} color={t.fgDim} />
+          </button>
+        )}
       </div>
 
       {/* Expanded body — per-set steppers + rest countdown */}
@@ -480,14 +553,154 @@ const ExerciseCard = ({ ex, group, units, round, program, density, restOn = true
   );
 };
 
+// ─── Add-exercise picker — bottom sheet, grouped exercise list ──────────────
+// Tap one to add it to today's list (with the "classic" 3×8 default — the
+// add handler in app.jsx seeds `actuals.defaultReps = 8` and `sets = 3`).
+const ExercisePicker = ({ onPick, onClose, currentIds = [] }) => {
+  const t = useTheme();
+  const T = useT();
+  const [query, setQuery] = React.useState('');
+
+  const q = query.trim().toLowerCase();
+  const byGroup = SEED_GROUPS.map((g) => ({
+    group: g,
+    exercises: SEED_EXERCISES.filter((e) => e.group === g.id).filter((e) => {
+      if (!q) return true;
+      return T(e.nameKey).toLowerCase().includes(q);
+    }),
+  })).filter((entry) => entry.exercises.length > 0);
+  const total = byGroup.reduce((n, e) => n + e.exercises.length, 0);
+
+  return (
+    <div onClick={onClose} style={{
+      position: 'absolute', inset: 0, zIndex: 70,
+      background: 'rgba(0,0,0,0.55)',
+      display: 'flex', flexDirection: 'column', justifyContent: 'flex-end',
+      animation: 'pickerBgIn 200ms ease-out',
+    }}>
+      <style>{`
+        @keyframes pickerBgIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes pickerSheetIn { from { transform: translateY(100%); } to { transform: translateY(0); } }
+      `}</style>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        background: t.bg,
+        borderTopLeftRadius: 20, borderTopRightRadius: 20,
+        borderTop: `1px solid ${t.lineStrong}`,
+        maxHeight: '82%', display: 'flex', flexDirection: 'column',
+        animation: 'pickerSheetIn 240ms cubic-bezier(.3,.7,.4,1)',
+      }}>
+        {/* grab handle */}
+        <div style={{ padding: '8px 0 4px', display: 'flex', justifyContent: 'center' }}>
+          <div style={{ width: 36, height: 4, borderRadius: 2, background: t.lineStrong }} />
+        </div>
+        {/* header */}
+        <div style={{
+          padding: '6px 16px 10px',
+          display: 'flex', alignItems: 'flex-start', gap: 10,
+        }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{
+              fontFamily: t.ui, fontSize: 17, fontWeight: 700, color: t.fg,
+              letterSpacing: -0.2,
+            }}>{T('picker.title')}</div>
+            <div style={{
+              fontFamily: t.mono, fontSize: 10, color: t.fgDim,
+              marginTop: 3, letterSpacing: 0.4,
+            }}>{T('picker.sub')}</div>
+          </div>
+          <button onClick={onClose} style={{
+            width: 32, height: 32, borderRadius: 8,
+            background: t.surface2, border: `1px solid ${t.line}`,
+            color: t.fg, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+          }} aria-label="close">
+            <Icon name="x" size={16} stroke={2} />
+          </button>
+        </div>
+        {/* search */}
+        <div style={{ padding: '0 16px 8px' }}>
+          <input type="text" value={query} onChange={(e) => setQuery(e.target.value)}
+                 placeholder={T('picker.search')} autoFocus={false}
+                 style={{
+                   width: '100%', height: 40, borderRadius: 10,
+                   background: t.surface2, border: `1px solid ${t.line}`,
+                   color: t.fg, fontFamily: t.mono, fontSize: 13,
+                   padding: '0 12px', outline: 'none',
+                 }} />
+        </div>
+        {/* list */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '4px 16px 18px' }}>
+          {total === 0 && (
+            <div style={{
+              padding: '40px 0', textAlign: 'center',
+              fontFamily: t.mono, fontSize: 11, color: t.fgDim,
+              letterSpacing: 0.6, textTransform: 'uppercase',
+            }}>{T('picker.empty')}</div>
+          )}
+          {byGroup.map(({ group: g, exercises }) => (
+            <div key={g.id} style={{ marginBottom: 14 }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '6px 2px 8px',
+                fontFamily: t.mono, fontSize: 10, color: t.fgDim,
+                letterSpacing: 1.2, textTransform: 'uppercase',
+              }}>
+                <GroupDot id={g.id} size={6} />
+                <span>{T(g.nameKey)}</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {exercises.map((e) => {
+                  const inToday = currentIds.includes(e.id);
+                  return (
+                    <button key={e.id} onClick={() => onPick(e.id)}
+                            style={{
+                              width: '100%', textAlign: 'left',
+                              padding: '10px 12px', borderRadius: 10,
+                              background: t.surface, border: `1px solid ${t.line}`,
+                              color: t.fg, cursor: 'pointer', fontFamily: 'inherit',
+                              display: 'flex', alignItems: 'center', gap: 10,
+                            }}>
+                      <div style={{
+                        width: 28, height: 28, borderRadius: 8, flexShrink: 0,
+                        background: t.surface2, border: `1px solid ${t.line}`,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>
+                        <GroupDot id={e.group} size={8} />
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{
+                          fontFamily: t.ui, fontWeight: 600, fontSize: 13.5,
+                          color: t.fg, letterSpacing: -0.1,
+                        }}>{T(e.nameKey)}</div>
+                        <div style={{
+                          fontFamily: t.mono, fontSize: 10, color: t.fgDim,
+                          marginTop: 2, letterSpacing: 0.2,
+                        }}>{T(equipKey(e.equip))}</div>
+                      </div>
+                      {inToday && <Pill tone="mute">{T('picker.alreadyIn')}</Pill>}
+                      <Icon name="plus" size={14} color={t.fgMute} />
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ─── Active screen ──────────────────────────────────────────────────────────
 const ScreenToday = ({ units, program, run, density,
                        onLog, startSession, pauseSession, resumeSession, finishSession,
-                       setActuals, setSetActuals }) => {
+                       setActuals, setSetActuals,
+                       onAddExercise, onRemoveExercise, onReorderExercises, onRestoreDefault }) => {
   const t = useTheme();
   const T = useT();
   const [expanded, setExpanded] = React.useState(null);
   const [confirmFinish, setConfirmFinish] = React.useState(false);
+  const [pickerOpen, setPickerOpen] = React.useState(false);
   const [restOn, setRestOn] = React.useState(true);
   const [defaultRestSec, setDefaultRestSec] = React.useState(180);
 
@@ -497,8 +710,15 @@ const ScreenToday = ({ units, program, run, density,
   const day = program.days[dayIdx];
   const session = run.session || { state: 'idle' };
 
-  const exercises = day.exercises.map((id) => exerciseInRun(id, run)).filter(Boolean);
+  // Effective list (respects per-run day overrides). Memoize id-list for
+  // the reorder hook so ids identity is stable across renders that don't
+  // change the list.
+  const exerciseIds = effectiveDayExercises(run, program, dayIdx);
+  const exercises = exerciseIds.map((id) => exerciseInRun(id, run)).filter(Boolean);
+  const dayOverridden = isDayOverridden(run, dayIdx);
   const isRecoveryRound = round % program.recovery.every === 0;
+
+  const reorder = useReorderable(exerciseIds, (from, to) => onReorderExercises && onReorderExercises(from, to));
 
   const logKey = (exId) => `${exId}-r${round}-d${dayIdx}`;
   const getDoneArr = (exId) => log[logKey(exId)] || [];
@@ -527,137 +747,202 @@ const ScreenToday = ({ units, program, run, density,
       const w = perSet[i]?.weight !== undefined
         ? perSet[i].weight * (units === 'lb' ? 0.45359237 : 1)
         : plannedW;
-      const reps = perSet[i]?.reps ?? e.reps;
+      const reps = perSet[i]?.reps ?? a?.defaultReps ?? e.reps;
       vol += w * reps;
     }
     return s + vol;
   }, 0);
 
   return (
-    <div style={{ height: '100%', overflowY: 'auto', overflowX: 'hidden', paddingBottom: 110, position: 'relative' }}>
-      {/* Brand bar */}
-      <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '10px 20px 0',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <Brand size={14} />
-          <span style={{
-            fontFamily: t.mono, fontSize: 10, color: t.fgDim, letterSpacing: 1.4, textTransform: 'uppercase',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220,
-          }}>{T(program.nameKey)}</span>
+    <div style={{ height: '100%', position: 'relative', overflow: 'hidden' }}>
+      {/* Scrollable content */}
+      <div style={{ height: '100%', overflowY: 'auto', overflowX: 'hidden', paddingBottom: 110 }}>
+        {/* Brand bar */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '10px 20px 0',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+            <Brand size={14} />
+            <span style={{
+              fontFamily: t.mono, fontSize: 10, color: t.fgDim, letterSpacing: 1.4, textTransform: 'uppercase',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220,
+            }}>{T(program.nameKey)}</span>
+          </div>
+          {isRecoveryRound && <Pill tone="signal">◇ {T('common.deloadCaps')}</Pill>}
         </div>
-        {isRecoveryRound && <Pill tone="signal">◇ {T('common.deloadCaps')}</Pill>}
-      </div>
 
-      {/* Session bar — Start / Pause+Finish / Resume+Finish */}
-      <SessionBar session={session} units={units}
-                  onStart={startSession}
-                  onPause={pauseSession}
-                  onResume={resumeSession}
-                  onFinish={() => setConfirmFinish(true)} />
+        {/* Mesocycle preview — strip when session running, calendar otherwise */}
+        <MesoPreview program={program} run={run} units={units}
+                     tab="active" sessionActive={session.state === 'active'} />
 
-      <TopBar sub={`${T('common.round')} ${String(round).padStart(2,'0')} / ${String(program.rounds).padStart(2,'0')} · ${T('common.day').toUpperCase()} ${day.id}`}
-              title={T(day.labelKey)} />
+        {/* Session bar — Start / Pause+Finish / Resume+Finish */}
+        <SessionBar session={session} units={units}
+                    onStart={startSession}
+                    onPause={pauseSession}
+                    onResume={resumeSession}
+                    onFinish={() => setConfirmFinish(true)} />
 
-      {/* Mission brief — KV strip */}
-      <div style={{ padding: '4px 16px 16px' }}>
-        <Card padding={14}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-            <KV label={T('today.exercises')} value={exercises.length} />
-            <KV label={T('today.sets')} value={`${doneSets}/${totalSets}`} color={doneSets === totalSets ? t.success : t.fg} />
-            <KV label={T('today.volume')} value={(doneVolume / 1000).toFixed(1)} unit={units === 'lb' ? 'klb' : 't'} />
-            <KV label={T('today.est')} value={estimateMinutes(exercises, run, restOn, defaultRestSec)} unit={T('common.min')} />
-          </div>
-          <div style={{ height: 4, background: t.surface2, borderRadius: 4, marginTop: 14, overflow: 'hidden' }}>
+        <TopBar sub={`${T('common.round')} ${String(round).padStart(2,'0')} / ${String(program.rounds).padStart(2,'0')} · ${T('common.day').toUpperCase()} ${day.id}`}
+                title={T(day.labelKey)} />
+
+        {/* Mission brief — KV strip */}
+        <div style={{ padding: '4px 16px 16px' }}>
+          <Card padding={14}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <KV label={T('today.exercises')} value={exercises.length} />
+              <KV label={T('today.sets')} value={`${doneSets}/${totalSets}`} color={doneSets === totalSets ? t.success : t.fg} />
+              <KV label={T('today.volume')} value={(doneVolume / 1000).toFixed(1)} unit={units === 'lb' ? 'klb' : 't'} />
+              <KV label={T('today.est')} value={estimateMinutes(exercises, run, restOn, defaultRestSec)} unit={T('common.min')} />
+            </div>
+            <div style={{ height: 4, background: t.surface2, borderRadius: 4, marginTop: 14, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', width: `${totalSets ? (doneSets / totalSets) * 100 : 0}%`,
+                background: doneSets === totalSets ? t.success : t.accent,
+                transition: 'width 280ms cubic-bezier(.3,.7,.4,1)',
+              }} />
+            </div>
+            {/* Rest toggle + default-rest stepper */}
             <div style={{
-              height: '100%', width: `${totalSets ? (doneSets / totalSets) * 100 : 0}%`,
-              background: doneSets === totalSets ? t.success : t.accent,
-              transition: 'width 280ms cubic-bezier(.3,.7,.4,1)',
-            }} />
-          </div>
-          {/* Rest toggle + default-rest stepper */}
-          <div style={{
-            marginTop: 12, paddingTop: 12, borderTop: `1px solid ${t.line}`,
-            display: 'flex', flexDirection: 'column', gap: 10,
-          }}>
-            <button onClick={() => setRestOn(!restOn)} style={{
-              width: '100%',
-              display: 'flex', alignItems: 'center', gap: 10,
-              padding: 0, background: 'transparent', border: 0,
-              cursor: 'pointer', color: 'inherit', textAlign: 'left',
+              marginTop: 12, paddingTop: 12, borderTop: `1px solid ${t.line}`,
+              display: 'flex', flexDirection: 'column', gap: 10,
             }}>
-              <span style={{
-                width: 20, height: 20, borderRadius: 6,
-                background: restOn ? t.fg : 'transparent',
-                border: `1px solid ${restOn ? t.fg : t.lineStrong}`,
-                display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-                transition: 'background 120ms',
+              <button onClick={() => setRestOn(!restOn)} style={{
+                width: '100%',
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: 0, background: 'transparent', border: 0,
+                cursor: 'pointer', color: 'inherit', textAlign: 'left',
               }}>
-                {restOn && <Icon name="check" size={13} stroke={3} color={t.bg} />}
-              </span>
-              <span style={{
-                fontFamily: t.ui, fontSize: 12, fontWeight: 500, color: t.fg,
-              }}>{T('today.includeRest')}</span>
-              <span style={{
-                marginLeft: 'auto',
-                fontFamily: t.mono, fontSize: 10, color: t.fgDim,
-                letterSpacing: 0.4, textTransform: 'uppercase', fontVariantNumeric: 'tabular-nums',
-              }}>{restOn ? 'ON' : 'OFF'}</span>
-            </button>
-            {/* Default rest — separate min + sec steppers (no carry) */}
-            <div style={{
-              display: 'flex', alignItems: 'flex-start', gap: 8,
-              opacity: restOn ? 1 : 0.5,
-            }}>
-              <span style={{
-                flex: 1, fontFamily: t.ui, fontSize: 12, fontWeight: 500, color: t.fgMute,
-                paddingTop: 10,
-              }}>{T('today.defaultRest')}</span>
-              <div style={{ width: 82, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-                <SetStepper value={Math.floor(defaultRestSec / 60)}
-                            step={1} min={0} max={15}
-                            onChange={(m) => setDefaultRestSec(m * 60 + (defaultRestSec % 60))}
-                            color={t.fg} />
                 <span style={{
-                  fontFamily: t.mono, fontSize: 8, color: t.fgDim,
-                  letterSpacing: 1.2, textTransform: 'uppercase',
-                }}>min</span>
-              </div>
-              <div style={{ width: 82, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-                <SetStepper value={defaultRestSec % 60}
-                            step={15} min={0} max={45}
-                            onChange={(s) => setDefaultRestSec(Math.floor(defaultRestSec / 60) * 60 + s)}
-                            color={t.fg} />
+                  width: 20, height: 20, borderRadius: 6,
+                  background: restOn ? t.fg : 'transparent',
+                  border: `1px solid ${restOn ? t.fg : t.lineStrong}`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                  transition: 'background 120ms',
+                }}>
+                  {restOn && <Icon name="check" size={13} stroke={3} color={t.bg} />}
+                </span>
                 <span style={{
-                  fontFamily: t.mono, fontSize: 8, color: t.fgDim,
-                  letterSpacing: 1.2, textTransform: 'uppercase',
-                }}>sec</span>
+                  fontFamily: t.ui, fontSize: 12, fontWeight: 500, color: t.fg,
+                }}>{T('today.includeRest')}</span>
+                <span style={{
+                  marginLeft: 'auto',
+                  fontFamily: t.mono, fontSize: 10, color: t.fgDim,
+                  letterSpacing: 0.4, textTransform: 'uppercase', fontVariantNumeric: 'tabular-nums',
+                }}>{restOn ? 'ON' : 'OFF'}</span>
+              </button>
+              {/* Default rest — separate min + sec steppers (no carry) */}
+              <div style={{
+                display: 'flex', alignItems: 'flex-start', gap: 8,
+                opacity: restOn ? 1 : 0.5,
+              }}>
+                <span style={{
+                  flex: 1, fontFamily: t.ui, fontSize: 12, fontWeight: 500, color: t.fgMute,
+                  paddingTop: 10,
+                }}>{T('today.defaultRest')}</span>
+                <div style={{ width: 82, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                  <SetStepper value={Math.floor(defaultRestSec / 60)}
+                              step={1} min={0} max={15}
+                              onChange={(m) => setDefaultRestSec(m * 60 + (defaultRestSec % 60))}
+                              color={t.fg} />
+                  <span style={{
+                    fontFamily: t.mono, fontSize: 8, color: t.fgDim,
+                    letterSpacing: 1.2, textTransform: 'uppercase',
+                  }}>min</span>
+                </div>
+                <div style={{ width: 82, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+                  <SetStepper value={defaultRestSec % 60}
+                              step={15} min={0} max={45}
+                              onChange={(s) => setDefaultRestSec(Math.floor(defaultRestSec / 60) * 60 + s)}
+                              color={t.fg} />
+                  <span style={{
+                    fontFamily: t.mono, fontSize: 8, color: t.fgDim,
+                    letterSpacing: 1.2, textTransform: 'uppercase',
+                  }}>sec</span>
+                </div>
               </div>
             </div>
+          </Card>
+        </div>
+
+        {/* Exercises — drag to reorder, × to remove, "+ Add" at end */}
+        <Section eyebrow={T('today.mission')} title={T('today.exercises')}
+                 action={dayOverridden
+                   ? <Btn variant="quiet" size="sm" onClick={onRestoreDefault}>{T('today.restoreDefault')}</Btn>
+                   : null}
+                 style={{ padding: '0 16px' }}>
+          {/* Modified badge — small inline strip below the section title */}
+          {dayOverridden && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 6,
+              fontFamily: t.mono, fontSize: 9, color: t.signal,
+              letterSpacing: 1.2, textTransform: 'uppercase',
+              marginTop: 2, marginBottom: 6,
+            }}>
+              <span style={{ width: 6, height: 6, borderRadius: 6, background: t.signal }} />
+              {T('today.dayModified')}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 4 }}>
+            {exercises.map((e, idx) => {
+              const isDragging = reorder.drag?.id === e.id;
+              const dy = isDragging ? (reorder.drag.fingerY - reorder.drag.startFingerY) : 0;
+              return (
+                <div key={e.id} ref={reorder.setRef(e.id)} style={{
+                  transform: isDragging ? `translateY(${dy}px) scale(1.015)` : 'none',
+                  zIndex: isDragging ? 20 : 'auto',
+                  position: 'relative',
+                  transition: isDragging ? 'none' : 'transform 220ms cubic-bezier(.3,.7,.4,1)',
+                  filter: isDragging ? 'drop-shadow(0 14px 28px rgba(0,0,0,0.45))' : 'none',
+                  opacity: isDragging ? 0.98 : 1,
+                  willChange: isDragging ? 'transform' : 'auto',
+                }}>
+                  <ExerciseCard ex={e} group={findGroup(e.group)}
+                                units={units} round={round} program={program} density={density}
+                                restOn={restOn} defaultRestSec={defaultRestSec}
+                                doneArr={getDoneArr(e.id)}
+                                setDoneArr={(arr) => setDoneArr(e.id, arr)}
+                                actuals={getActuals(e.id)}
+                                onActuals={(patch) => setActuals(e.id, patch)}
+                                onSetActuals={(i, patch) => setSetActuals(e.id, i, patch)}
+                                expanded={expanded === e.id}
+                                onToggle={() => setExpanded(expanded === e.id ? null : e.id)}
+                                dragHandleProps={reorder.getHandleProps(e.id)}
+                                dragging={isDragging}
+                                onRemove={() => {
+                                  if (expanded === e.id) setExpanded(null);
+                                  onRemoveExercise && onRemoveExercise(idx);
+                                }} />
+                </div>
+              );
+            })}
+
+            {/* Add-exercise — full-width dashed at the end of the list */}
+            <button onClick={() => setPickerOpen(true)} style={{
+              width: '100%', minHeight: 52, marginTop: 2,
+              borderRadius: t.density.cardR,
+              background: 'transparent', border: `1px dashed ${t.lineStrong}`,
+              color: t.fgMute, cursor: 'pointer',
+              fontFamily: t.ui, fontSize: 13, fontWeight: 600, letterSpacing: 0.2,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+            }}>
+              <Icon name="plus" size={16} stroke={2} color={t.fgMute} />
+              {T('today.addExercise')}
+            </button>
           </div>
-        </Card>
+        </Section>
       </div>
 
-      {/* Exercises */}
-      <Section eyebrow={T('today.mission')} title={T('today.exercises')}
-               action={<Btn variant="quiet" size="sm" icon="plus">{T('common.add')}</Btn>}
-               style={{ padding: '0 16px' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 4 }}>
-          {exercises.map((e) => (
-            <ExerciseCard key={e.id} ex={e} group={findGroup(e.group)}
-                          units={units} round={round} program={program} density={density}
-                          restOn={restOn} defaultRestSec={defaultRestSec}
-                          doneArr={getDoneArr(e.id)}
-                          setDoneArr={(arr) => setDoneArr(e.id, arr)}
-                          actuals={getActuals(e.id)}
-                          onActuals={(patch) => setActuals(e.id, patch)}
-                          onSetActuals={(idx, patch) => setSetActuals(e.id, idx, patch)}
-                          expanded={expanded === e.id}
-                          onToggle={() => setExpanded(expanded === e.id ? null : e.id)} />
-          ))}
-        </div>
-      </Section>
+      {/* Picker bottom sheet */}
+      {pickerOpen && (
+        <ExercisePicker currentIds={exerciseIds}
+                        onClose={() => setPickerOpen(false)}
+                        onPick={(exId) => {
+                          onAddExercise && onAddExercise(exId);
+                          setPickerOpen(false);
+                        }} />
+      )}
 
       {/* Confirm-finish dialog */}
       {confirmFinish && (
